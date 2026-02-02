@@ -8,7 +8,7 @@ import sys
 
 # ================= ⚙️ 配置区域 =================
 NUM_CARDS = 84
-OUTPUT_DIR = ".aidixit/startup"
+OUTPUT_DIR = "startup"
 DELAY_SECONDS = 12
 COMPLEXITY_RATIO = 0.4 
 LOG_FILE = "dixit_generation.log"
