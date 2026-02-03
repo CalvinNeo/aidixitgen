@@ -7,12 +7,12 @@ import logging
 import sys
 
 # ================= ⚙️ 配置区域 =================
-NUM_CARDS = 84
-OUTPUT_DIR = "startup"
+NUM_CARDS = 250
+OUTPUT_DIR = "stable"
 DELAY_SECONDS = 12
 COMPLEXITY_RATIO = 0.4 
 LOG_FILE = "dixit_generation.log"
-TEXT_MAX_RETRIES = 5
+TEXT_MAX_RETRIES = 0
 IMAGE_MAX_RETRIES = 5
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 BACKOFF_BASE_SECONDS = 2
@@ -284,6 +284,85 @@ def generate_image(prompt, filename):
     log_failed_url("最终失败URL", url)
     return False
 
+def load_token(path="./.ai/HFTOKEN"):
+    """从文件读取 Token，去除空白符"""
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                token = f.read().strip()
+                if token:
+                    print(f"🔑 已加载 Token: {token[:4]}******")
+                    return token
+        except Exception as e:
+            print(f"⚠️ 读取 Token 文件失败: {e}")
+    else:
+        print(f"⚠️ 警告: 找不到 Token 文件: {path} (如果使用 Pollinations 可忽略)")
+    return ""
+
+HF_TOKEN = load_token()
+HF_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"   # 推荐 FLUX，也可以用 "stabilityai/stable-diffusion-xl-base-1.0"
+USE_PROXY = True
+
+def get_proxies():
+    """获取代理配置"""
+    # 优先使用脚本里强制指定的代理
+    if USE_PROXY:
+        return {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}
+    
+    # 如果脚本里没指定，自动尝试读取系统的环境变量 (即你 export 的那些)
+    # requests 库默认会自动读取环境变量，所以这里返回 None 即可让它自动接管
+    return None
+
+def generate_huggingface(prompt, filename):
+    file_path = os.path.join(OUTPUT_DIR, filename)
+    """引擎 B: Hugging Face (新版 URL + SSL 修复)"""
+    if HF_TOKEN.startswith("hf_xx"):
+        print("   ❌ 错误: 请先在脚本顶部填入正确的 HF_TOKEN！")
+        return
+
+    # 【关键修改】这里换成了新的 router 域名
+    api_url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
+    
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    proxies = get_proxies()
+    
+    payload = {
+        "inputs": prompt,
+        "parameters": {"width": 1024, "height": 1024}
+    }
+
+    print(f"   [HuggingFace] 正在请求 API: {filename} ...")
+
+    try:
+        # verify=False 必须保留，否则代理会报错
+        response = requests.post(
+            api_url, 
+            headers=headers, 
+            json=payload, 
+            proxies=proxies, 
+            timeout=120, 
+            verify=False
+        )
+        
+        # 处理模型冷启动 (503)
+        if response.status_code == 503:
+            wait_time = response.json().get("estimated_time", 20)
+            print(f"   😴 模型正在启动中，需等待 {wait_time:.1f} 秒...")
+            time.sleep(wait_time)
+            # 递归重试
+            return generate_huggingface(prompt, filename)
+
+        if response.status_code == 200:
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+            print(f"   ✅ 成功保存: {file_path}")
+        else:
+            # 打印详细错误信息以便排查
+            print(f"   ❌ 失败 (Code {response.status_code}): {response.text[:200]}")
+
+    except Exception as e:
+        print(f"   ❌ 请求发生错误: {e}")
+
 # ================= 🚀 主程序 =================
 
 def main():
@@ -310,7 +389,7 @@ def main():
             prompt = construct_concept(i)
             
             # 2. 绘图
-            success = generate_image(prompt, filename)
+            success = generate_huggingface(prompt, filename)
             
             # 3. 冷却
             if success:
