@@ -12,6 +12,20 @@ OUTPUT_DIR = "startup"
 DELAY_SECONDS = 12
 COMPLEXITY_RATIO = 0.4 
 LOG_FILE = "dixit_generation.log"
+TEXT_MAX_RETRIES = 5
+IMAGE_MAX_RETRIES = 5
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+BACKOFF_BASE_SECONDS = 2
+BACKOFF_MAX_SECONDS = 30
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1"
+]
+
+SESSION = requests.Session()
 
 # ================= 📝 日志系统 =================
 def setup_logging():
@@ -117,6 +131,13 @@ def ensure_dir(directory):
 def clean_text(text):
     return text.replace("**", "").replace('"', '').strip()
 
+def compute_backoff_seconds(attempt):
+    base_delay = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
+    return base_delay + random.uniform(0.5, 1.5)
+
+def log_failed_url(reason, url):
+    logger.warning(f"   🔗 {reason}: {url}")
+
 def construct_concept(index):
     """构建概念并获取 AI 描述 (修复了变量作用域bug + 增加了文本重试)"""
     is_complex = random.random() < COMPLEXITY_RATIO
@@ -174,27 +195,42 @@ def construct_concept(index):
     seed = random.randint(0, 100000)
     url = f"https://text.pollinations.ai/{prompt_encoded}?seed={seed}&model=openai"
     
-    max_retries = 3
-    for attempt in range(max_retries):
+    for attempt in range(TEXT_MAX_RETRIES):
         try:
             start_time = time.time()
-            response = requests.get(url, timeout=30)
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            response = SESSION.get(url, headers=headers, timeout=(5, 30))
             
             if response.status_code == 200:
                 desc = clean_text(response.text)
+                if not desc:
+                    wait = compute_backoff_seconds(attempt)
+                    logger.warning(f"   ⚠️ 文本API返回空内容，等待 {wait:.1f}s 后重试 ({attempt+1}/{TEXT_MAX_RETRIES})...")
+                    log_failed_url("空内容URL", url)
+                    time.sleep(wait)
+                    continue
                 elapsed = time.time() - start_time
                 logger.info(f"   💡 获得灵感 (耗时 {elapsed:.2f}s): {desc[:60]}...")
                 return desc
+            if response.status_code not in RETRY_STATUS_CODES:
+                logger.error(f"   ❌ 文本API状态码 {response.status_code}，停止重试")
+                log_failed_url("失败URL", url)
+                break
             else:
-                logger.warning(f"   ⚠️ 文本API状态码 {response.status_code}，重试中 ({attempt+1}/{max_retries})...")
-                time.sleep(2)
+                wait = compute_backoff_seconds(attempt)
+                logger.warning(f"   ⚠️ 文本API状态码 {response.status_code}，等待 {wait:.1f}s 后重试 ({attempt+1}/{TEXT_MAX_RETRIES})...")
+                log_failed_url("失败URL", url)
+                time.sleep(wait)
                 
         except Exception as e:
-            logger.warning(f"   ⚠️ 获取灵感网络异常: {e}，重试中 ({attempt+1}/{max_retries})...")
-            time.sleep(2)
+            wait = compute_backoff_seconds(attempt)
+            logger.warning(f"   ⚠️ 获取灵感网络异常: {e}，等待 {wait:.1f}s 后重试 ({attempt+1}/{TEXT_MAX_RETRIES})...")
+            log_failed_url("异常URL", url)
+            time.sleep(wait)
     
-    # 如果重试 3 次都失败，使用我们提前准备好的 fallback_prompt
+    # 如果多次重试都失败，使用我们提前准备好的 fallback_prompt
     logger.error(f"   ❌ 多次尝试失败，启用兜底 Prompt")
+    log_failed_url("最终失败URL", url)
     return fallback_prompt
 
 def generate_image(prompt, filename):
@@ -203,36 +239,49 @@ def generate_image(prompt, filename):
     encoded_prompt = urllib.parse.quote(full_prompt)
     seed = random.randint(0, 999999)
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&seed={seed}&width=1024&height=1024"
-    
-    headers = {"User-Agent": "Mozilla/5.0"}
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    for attempt in range(IMAGE_MAX_RETRIES):
         try:
-            logger.info(f"   🎨 正在绘制 (尝试 {attempt+1}/{max_retries})...")
+            logger.info(f"   🎨 正在绘制 (尝试 {attempt+1}/{IMAGE_MAX_RETRIES})...")
             start_t = time.time()
             
-            r = requests.get(url, headers=headers, timeout=120)
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            r = SESSION.get(url, headers=headers, timeout=(10, 120))
             
-            if r.status_code == 200:
+            content_type = r.headers.get("Content-Type", "").lower()
+            if r.status_code == 200 and content_type.startswith("image/") and len(r.content) > 1024:
                 with open(file_path, 'wb') as f:
                     f.write(r.content)
                 elapsed = time.time() - start_t
                 file_size = os.path.getsize(file_path) / 1024 
                 logger.info(f"   ✅ 保存成功: {filename} ({file_size:.1f}KB, 耗时 {elapsed:.1f}s)")
                 return True
+            if r.status_code not in RETRY_STATUS_CODES:
+                logger.error(f"   ❌ 图片服务器错误: {r.status_code}，停止重试")
+                log_failed_url("失败URL", url)
+                break
+            wait = compute_backoff_seconds(attempt)
+            if r.status_code == 200:
+                logger.warning(f"   ⚠️ 返回内容非图片 (Content-Type: {content_type or 'unknown'})，等待 {wait:.1f}s 后重试...")
+                log_failed_url("非图片URL", url)
             else:
-                logger.warning(f"   ⚠️ 图片服务器错误: {r.status_code}，等待重试...")
-                time.sleep(5)
+                logger.warning(f"   ⚠️ 图片服务器错误: {r.status_code}，等待 {wait:.1f}s 后重试...")
+                log_failed_url("失败URL", url)
+            time.sleep(wait)
                 
         except requests.exceptions.ReadTimeout:
-            logger.warning(f"   🐢 生成超时 (服务器繁忙)，等待重试...")
-            time.sleep(5)
+            wait = compute_backoff_seconds(attempt)
+            logger.warning(f"   🐢 生成超时 (服务器繁忙)，等待 {wait:.1f}s 后重试...")
+            log_failed_url("超时URL", url)
+            time.sleep(wait)
         except Exception as e:
-            logger.error(f"   ❌ 连接异常: {e}")
-            time.sleep(5)
+            wait = compute_backoff_seconds(attempt)
+            logger.error(f"   ❌ 连接异常: {e}，等待 {wait:.1f}s 后重试...")
+            log_failed_url("异常URL", url)
+            time.sleep(wait)
             
     logger.error(f"   ❌ {filename} 最终失败，跳过。")
+    log_failed_url("最终失败URL", url)
     return False
 
 # ================= 🚀 主程序 =================
